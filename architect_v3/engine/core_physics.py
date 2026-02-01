@@ -55,8 +55,8 @@ class VectorizedCore:
         print(f"ARCHITECT: Initializing Market-Regime Backtest ({start_date} to {end_date})...")
         start_time = time.time()
 
-        # REALITY CONSTANTS
-        SLIPPAGE_RATE = 0.0050
+        # REALITY CONSTANTS (Updated Feb 2026)
+        SLIPPAGE_RATE = 0.0032 
         MAX_VOLUME_PARTICIPATION = 0.02
 
         # ---------------------------------------------------------
@@ -132,19 +132,29 @@ class VectorizedCore:
             filtered.sort(["date", "momentum"], descending=[False, True])
             .group_by("date").head(top_n)
             
-            # --- ARCHITECT PROTOCOL v1.0 ---
-            # 1. Thermodynamic Efficiency Filter (Avoid Friction > 15% of Edge)
-            #    Edge proxy = Momentum. Cost = SLIPPAGE_RATE.
-            #    Threshold: Momentum > (0.0050 / 0.15) = 3.33%
-            .filter(pl.col("momentum") > (SLIPPAGE_RATE / 0.15))
-
-            # 2. Risk Parity Sizing (Target Vol = 15%)
+            # --- ARCHITECT PROTOCOL v5.0 (Intelligent Velocity) ---
+            # 1. METRICS: 20-Day Volatility & 50-Day SMA
             .with_columns([
-                (0.15 / pl.col("volatility")).alias("vol_weight")
+                 (pl.col("volatility") * (252**0.5)).alias("ann_vol"),
+                 pl.col("close").rolling_mean(window_size=50).over("ticker").alias("sma_50")
             ])
-
-            # 3. Momentum Scaler (Size up if trend is strong)
-            #    Normalize 100% Return (1.0) to Max Confidence.
+            .with_columns([
+                # 2. BASE SIZING (Risk Parity, Target Vol = 30%)
+                #    Weight = 0.30 / Ann_Vol
+                (0.30 / pl.col("ann_vol")).alias("raw_weight")
+            ])
+            .with_columns([
+                # 3. INTELLIGENT BRAKE LOGIC
+                #    Condition A: Extreme Volatility (> 80%)
+                #    Condition B: Downtrend (Price < SMA 50)
+                #    Logic: Only Brake (0.33x) if BOTH are true. Else, Full Speed.
+                pl.when((pl.col("ann_vol") > 0.80) & (pl.col("close") < pl.col("sma_50")))
+                .then(pl.col("raw_weight") * 0.33)
+                .otherwise(pl.col("raw_weight"))
+                .alias("vol_weight")
+            ])
+            
+            # 4. Momentum Scaler (Retained from v1.0)
             .with_columns([
                 pl.col("momentum").clip(0.0, 1.0).alias("signal_strength")
             ])
@@ -153,12 +163,15 @@ class VectorizedCore:
                 (pl.col("rupee_volume") * MAX_VOLUME_PARTICIPATION / initial_capital).alias("max_weight")
             ])
             .with_columns([
-                # Final Weight = VolWeight * Scaler
-                # Constraint: Min(Result, Liquidity, 30% Cap)
+                # Final Weight Calculation
+                # Constraints: 
+                # 1. Cap single stock at 30% (0.30) - Increased for v5
+                # 2. Liquidity (Max Weight)
+                # 3. Intelligent Volatility Sizing
                 pl.min_horizontal(
                     (pl.col("vol_weight") * pl.col("signal_strength")),
                     pl.col("max_weight"), 
-                    pl.lit(0.30)
+                    pl.lit(0.30)  # Protocol v5: 30% Max
                 ).alias("weight")
             ])
             .sort(["ticker", "date"])
