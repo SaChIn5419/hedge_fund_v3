@@ -1,0 +1,9 @@
+architect_v3/data/
+*.csv
+__pycache__/
+.venv/
+*.log
+.DS_Store
+*.parquet
+.idea/
+.vscode/

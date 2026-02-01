@@ -1,0 +1,24 @@
+# ARCHITECT V3 - SYSTEMS CONFIGURATION
+hardware:
+  memory_limit_gb: 4
+  cpu_threads: 4
+
+universe:
+  nse_parquet_path: "data/nse/*.parquet"
+
+alpha_model:
+  momentum_window: 90
+  volatility_window: 20
+  energy_threshold: 0.05
+  max_positions: 5
+  cash_buffer: 0.05 # Reserve 5% cash for slippage safety
+
+# Indian Market Constants
+physics:
+  risk_free_rate: 0.06 # 6% India G-Sec
+  transaction_friction: 0.0025 # 0.25% (STT + GST + Slippage)
+
+brokers:
+  dhan:
+    client_id: "YOUR_DHAN_CLIENT_ID" # Replace with your actual Client ID
+    access_token: "YOUR_DHAN_TOKEN"  # Replace with your actual Access Token

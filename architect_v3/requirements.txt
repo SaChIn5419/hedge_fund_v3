@@ -1,0 +1,8 @@
+polars
+duckdb
+numpy
+pyyaml
+dhanhq
+requests
+tqdm
+numba
