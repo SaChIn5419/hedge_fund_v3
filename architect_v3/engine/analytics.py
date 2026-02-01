@@ -230,6 +230,12 @@ class PolarsTearSheet:
                         <tr><td>Expected Shortfall (cVaR)</td><td class="negative">{cvar_95*100:.2f}%</td></tr>
                         <tr><td>Skew</td><td>{skew:.2f}</td></tr>
                         <tr><td>Kurtosis</td><td>{kurt:.2f}</td></tr>
+
+                        <tr class="section-header"><td colspan="2">System Audit (PnL vs Equity)</td></tr>
+                        <tr><td>Arithmetic PnL Sum</td><td>₹{total_net:,.0f}</td></tr>
+                        <tr><td>Geometric Growth</td><td>₹{df['equity'][-1] - df['equity'][0]:,.0f}</td></tr>
+                        <tr><td>Volatility Drag</td><td class="negative">₹{total_net - (df['equity'][-1] - df['equity'][0]):,.0f}</td></tr>
+                        <tr><td>Reality Check</td><td class="{'positive' if (df['equity'][-1] - df['equity'][0]) > total_net else 'negative'}">{"COMPOUNDING" if (df['equity'][-1] - df['equity'][0]) > total_net else "DRAG"}</td></tr>
                     </table>
                 </div>
 
@@ -335,7 +341,7 @@ class PolarsTearSheet:
         </html>
         """
 
-        output_file = "architect_tearsheet.html"
+        output_file = "architect_tearsheet_v2.html"
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(html_content)
 

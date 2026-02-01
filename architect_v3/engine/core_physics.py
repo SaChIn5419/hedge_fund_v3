@@ -131,15 +131,35 @@ class VectorizedCore:
         trades_lf = (
             filtered.sort(["date", "momentum"], descending=[False, True])
             .group_by("date").head(top_n)
-            .with_columns([(1.0 / pl.col("volatility")).alias("inv_vol")])
+            
+            # --- ARCHITECT PROTOCOL v1.0 ---
+            # 1. Thermodynamic Efficiency Filter (Avoid Friction > 15% of Edge)
+            #    Edge proxy = Momentum. Cost = SLIPPAGE_RATE.
+            #    Threshold: Momentum > (0.0050 / 0.15) = 3.33%
+            .filter(pl.col("momentum") > (SLIPPAGE_RATE / 0.15))
+
+            # 2. Risk Parity Sizing (Target Vol = 15%)
             .with_columns([
-                ((pl.col("inv_vol") / pl.col("inv_vol").sum()) * 0.95).over("date").alias("base_weight")
+                (0.15 / pl.col("volatility")).alias("vol_weight")
             ])
+
+            # 3. Momentum Scaler (Size up if trend is strong)
+            #    Normalize 100% Return (1.0) to Max Confidence.
+            .with_columns([
+                pl.col("momentum").clip(0.0, 1.0).alias("signal_strength")
+            ])
+
             .with_columns([
                 (pl.col("rupee_volume") * MAX_VOLUME_PARTICIPATION / initial_capital).alias("max_weight")
             ])
             .with_columns([
-                pl.min_horizontal("base_weight", "max_weight").alias("weight")
+                # Final Weight = VolWeight * Scaler
+                # Constraint: Min(Result, Liquidity, 30% Cap)
+                pl.min_horizontal(
+                    (pl.col("vol_weight") * pl.col("signal_strength")),
+                    pl.col("max_weight"), 
+                    pl.lit(0.30)
+                ).alias("weight")
             ])
             .sort(["ticker", "date"])
             .with_columns([
@@ -163,7 +183,7 @@ class VectorizedCore:
         ]).select([
             "date", "ticker", "close", "sma_20", "upper_band", "lower_band",
             "momentum", "energy", "volatility", "rupee_volume",
-            "base_weight", "max_weight", "weight", "fwd_return", "turnover",
+            "vol_weight", "max_weight", "weight", "fwd_return", "turnover",
             "position_value", "gross_pnl", "friction_pnl", "net_pnl"
         ]).sort(["date", "ticker"])
         
