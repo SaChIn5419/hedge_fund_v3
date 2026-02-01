@@ -6,3 +6,7 @@ dhanhq
 requests
 tqdm
 numba
+yfinance
+pandas
+plotly
+

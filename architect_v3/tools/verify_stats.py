@@ -48,7 +48,7 @@ def run():
     print("\n" + "="*40)
     print(f"RESULTS WITH NIFTY 200-SMA FILTER")
     print("="*40)
-    print(f"Final Equity:  ₹ {final_equity:,.2f}")
+    print(f"Final Equity:  INR {final_equity:,.2f}")
     print(f"CAGR:          {cagr*100:.2f}%")
     print(f"Max Drawdown:  {max_dd*100:.2f}%")
     print(f"Total Return:  {((final_equity/1000000)-1)*100:.2f}%")

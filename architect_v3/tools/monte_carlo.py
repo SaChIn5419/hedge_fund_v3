@@ -17,7 +17,7 @@ try:
     csv_path = os.path.join(os.path.dirname(__file__), '..', 'trade_log.csv')
     df = pl.read_csv(csv_path)
     df = df.with_columns(
-        pl.col("date").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S.%f")
+        pl.col("date").str.strptime(pl.Datetime, "%Y-%m-%dT%H:%M:%S%.f")
     )
 except Exception as e:
     print(f"Error loading trade_log.csv: {e}")
@@ -31,10 +31,19 @@ daily_portfolio = (
 )
 
 # Convert PnL to percentage returns
-INITIAL_CAPITAL = 1_000_000 
+# Infer Initial Capital from the data data to handle different backtest runs (IS vs OOS vs Full)
+# position_value = weight * initial_capital  =>  initial_capital = position_value / weight
+# We take the median to filter out potential outliers
+if "position_value" in df.columns and "weight" in df.columns:
+    inferred_capital = (df["position_value"] / df["weight"]).median()
+    print(f"ARCHITECT: Inferred base capital from trade log: INR {inferred_capital:,.0f}")
+else:
+    inferred_capital = 1_000_000
+    print("ARCHITECT: Could not infer capital, defaulting to INR 1,000,000")
+
 # Note: In the backtest, we might have periods of cash. For MC, we sample the active trading days.
 # Or better, we calculate return relative to capital.
-daily_returns_pct = (daily_portfolio["daily_pnl"] / INITIAL_CAPITAL).to_numpy()
+daily_returns_pct = (daily_portfolio["daily_pnl"] / inferred_capital).to_numpy()
 
 # 2. THE PHYSICS MATRIX (NUMPY BROADCASTING)
 # Simulating 5 years (1250 days) across 25,000 alternate universes.
@@ -52,7 +61,7 @@ simulation_matrix += 1
 
 # Calculate Cumulative Equity for all 25,000 paths instantly
 # np.cumprod along axis 1 calculates the compounding effect
-equity_paths = INITIAL_CAPITAL * np.cumprod(simulation_matrix, axis=1)
+equity_paths = inferred_capital * np.cumprod(simulation_matrix, axis=1)
 
 # 3. STATISTICAL EXTRACTION
 # We extract the 5th (Worst), 50th (Median), and 95th (Best) percentile paths
@@ -62,12 +71,12 @@ percentile_95 = np.percentile(equity_paths, 95, axis=0)
 
 # Final Capital Distribution (for Terminal output)
 final_capitals = equity_paths[:, -1]
-risk_of_ruin = np.sum(final_capitals < (INITIAL_CAPITAL * 0.5)) / SIMULATIONS
+risk_of_ruin = np.sum(final_capitals < (inferred_capital * 0.5)) / SIMULATIONS
 
 print("\n--- MONTE CARLO RESULTS (25,000 PATHS) ---")
-print(f"Median Final Equity: ₹ {np.median(final_capitals):,.2f}")
-print(f"95th Percentile (Luck): ₹ {np.percentile(final_capitals, 95):,.2f}")
-print(f"5th Percentile (Bad Luck): ₹ {np.percentile(final_capitals, 5):,.2f}")
+print(f"Median Final Equity: INR {np.median(final_capitals):,.2f}")
+print(f"95th Percentile (Luck): INR {np.percentile(final_capitals, 95):,.2f}")
+print(f"5th Percentile (Bad Luck): INR {np.percentile(final_capitals, 5):,.2f}")
 print(f"Risk of 50% Drawdown (Terminal): {risk_of_ruin * 100:.2f}%")
 print("------------------------------------------")
 

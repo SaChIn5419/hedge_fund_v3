@@ -180,7 +180,10 @@ class VectorizedCore:
         
         # 4. APPLY LATE REGIME FILTER (Portfolio Level)
         # Join the Nifty Regime with our daily portfolio returns
-        daily_portfolio = daily_portfolio.join(nifty, on="date", how="left").fill_null(1.0)
+        # Join on datetime[us] to match Nifty (which we cast to us earlier)
+        daily_portfolio = daily_portfolio.with_columns(
+            pl.col("date").cast(pl.Datetime("us"))
+        ).join(nifty, on="date", how="left").fill_null(1.0)
 
         # Apply the Circuit Breaker: If Nifty is bearish, return is 0 (Cash)
         daily_portfolio = daily_portfolio.with_columns([

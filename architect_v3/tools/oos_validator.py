@@ -44,7 +44,7 @@ def run_stress_test():
     )
     is_final = is_curve["equity"][-1]
     is_cagr = (is_final / 1000000.0) ** (1/8) - 1
-    print(f"   >> IS Result: ₹{is_final:,.0f} (CAGR: {is_cagr*100:.2f}%)")
+    print(f"   >> IS Result: INR {is_final:,.0f} (CAGR: {is_cagr*100:.2f}%)")
 
     # -------------------------------------------------------------
     # 2. OUT-OF-SAMPLE TEST (Validation Phase: 2023 - Present)
