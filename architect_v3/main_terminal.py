@@ -20,7 +20,10 @@ def run():
     # Initialise components
     alpha = DualEngineAlpha(momentum_window=cfg['alpha_model']['momentum_window'])
     core = VectorizedCore(cfg['universe']['nse_parquet_path'], alpha)
-    analytics = PolarsTearSheet(risk_free_rate=cfg['physics']['risk_free_rate'])
+    analytics = PolarsTearSheet(
+        risk_free_rate=cfg['physics']['risk_free_rate'],
+        benchmark_ticker=cfg['brokers']['dhan'].get('BENCHMARK_TICKER', '^NSEI')
+    )
 
     # Run historical backtest starting from 2015
     equity_curve = core.run_historical_backtest(

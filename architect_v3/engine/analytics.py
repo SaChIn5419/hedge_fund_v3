@@ -1,16 +1,22 @@
 import polars as pl
+import pandas as pd
 import numpy as np
 import json
 import webbrowser
 import os
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
 
 class PolarsTearSheet:
     """
-    ARCHITECT V3: Institutional Hyper-Grid Tear Sheet.
-    With Gaussian Channel visualization and trade markers.
+    ARCHITECT V9: QUANTUM DIAGNOSTICS & TEARSHEET.
+    Features: Rolling Z-Score, Alpha/Beta Convergence, Special Trading Days support.
     """
-    def __init__(self, risk_free_rate=0.06):
+    def __init__(self, risk_free_rate=0.06, benchmark_ticker="^NSEI"):
         self.rf = risk_free_rate
+        self.benchmark_ticker = benchmark_ticker
 
     def get_drawdown_table(self, df):
         """Identifies the Worst 10 Drawdowns."""
@@ -70,11 +76,142 @@ class PolarsTearSheet:
             pl.col("net_pnl").sum().alias("total_pnl")
         ]).sort("total_pnl", descending=True).head(20).to_dicts()
         return freq
+    
+    def fetch_benchmark_data(self, start_date, end_date):
+        """Fetches Benchmark Data for V9 Comparison."""
+        print(f"ARCHITECT: Fetching Benchmark ({self.benchmark_ticker})...")
+        try:
+            # Download with auto_adjust to get proper Close prices
+            bench = yf.download(self.benchmark_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+            
+            if bench.empty:
+                print("ARCHITECT WARN: Benchmark download failed (Empty).")
+                return None
+
+            # Handle MultiIndex if present
+            if isinstance(bench.columns, pd.MultiIndex):
+                if 'Close' in bench.columns.get_level_values(0):
+                     bench = bench.xs('Close', axis=1, level=0)
+                     if isinstance(bench, pd.DataFrame):
+                          bench = bench.iloc[:, 0]
+            elif 'Close' in bench.columns:
+                 bench = bench['Close']
+            
+            bench = bench.rename('benchmark_close')
+            bench.index = bench.index.tz_localize(None) # Ensure naive datetime
+            return bench
+        except Exception as e:
+            print(f"ARCHITECT WARN: Benchmark download error ({e})")
+            return None
+
+    def generate_v9_dashboard(self, df_pandas, bench_series):
+        """Generates the Plotly Figure for V9 Dashboard (Z-Score & Convergence)."""
+        
+        # 1. Prepare Data
+        # Align Benchmark
+        combined = df_pandas.set_index('date').join(bench_series, how='left')
+        
+        # Fill Benchmark gaps (ffill) - Crucial for holidays/missing days
+        combined['benchmark_close'] = combined['benchmark_close'].ffill()
+        combined = combined.dropna(subset=['benchmark_close']) # Drop start if benchmark missing
+
+        # Calculate Benchmark Equity
+        initial_equity = combined['equity'].iloc[0]
+        start_price = combined['benchmark_close'].iloc[0]
+        combined['benchmark_equity'] = combined['benchmark_close'] * (initial_equity / start_price)
+        combined['bench_returns'] = combined['benchmark_close'].pct_change().fillna(0)
+        combined['bench_drawdown'] = (combined['benchmark_equity'] - combined['benchmark_equity'].cummax()) / combined['benchmark_equity'].cummax()
+
+        # Rolling Metrics (126 Days / 6 Months)
+        window = 126
+        
+        # Rolling Beta
+        rolling_cov = combined['ret'].rolling(window).cov(combined['bench_returns'])
+        rolling_var = combined['bench_returns'].rolling(window).var()
+        combined['rolling_beta'] = rolling_cov / rolling_var
+        
+        # Rolling Alpha (Jensen's)
+        # Annualized Alpha = (RollingRet - Beta * RollingBenchRet) * 252 (simplified)
+        # Or just daily alpha spread
+        combined['rolling_alpha'] = (combined['ret'] - (combined['rolling_beta'] * combined['bench_returns']))
+        combined['rolling_alpha_ann'] = combined['rolling_alpha'].rolling(window).mean() * 252
+
+        # Rolling Z-Score (of Strategy Returns)
+        # Z = (Return - RollingMean) / RollingStd
+        r_mean = combined['ret'].rolling(window=20).mean()
+        r_std = combined['ret'].rolling(window=20).std()
+        combined['z_score'] = (combined['ret'] - r_mean) / r_std
+
+        # 2. Create Subplots (5 Rows)
+        fig = make_subplots(
+            rows=5, cols=1, 
+            shared_xaxes=True,
+            vertical_spacing=0.03,
+            row_heights=[0.3, 0.15, 0.15, 0.2, 0.2],
+            specs=[[{"secondary_y": True}], [{}], [{}], [{"secondary_y": True}], [{}]],
+            subplot_titles=(
+                "EQUITY CURVE: Strategy (Green) vs Nifty 50 (Grey)", 
+                "UNDERWATER PLOT: Drawdown Comparison", 
+                "RETURN Z-SCORE (20-Day): Deviation from Mean",
+                "CONVERGENCE: Rolling Alpha (Green) vs Beta (Orange)",
+                "REGIME GUARD: Market State (Blue = ON)"
+            )
+        )
+
+        # ROW 1: Equity
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['equity'], name='Architect V7', 
+                                 line=dict(color='#00ffcc', width=2)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['benchmark_equity'], name='Benchmark', 
+                                 line=dict(color='#666666', dash='dot', width=1)), row=1, col=1)
+        fig.update_yaxes(type="log", title="Log Equity", row=1, col=1, gridcolor='#222')
+
+        # ROW 2: Drawdown
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['drawdown'], name='Strat DD', 
+                                 fill='tozeroy', line=dict(color='#ff5555', width=1)), row=2, col=1)
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['bench_drawdown'], name='Bench DD', 
+                                 line=dict(color='#666666', dash='dot', width=1)), row=2, col=1)
+        fig.update_yaxes(title="DD %", row=2, col=1, gridcolor='#222')
+
+        # ROW 3: Rolling Z-Score
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['z_score'], name='Z-Score', 
+                                 line=dict(color='#b388ff', width=1)), row=3, col=1)
+        fig.add_hline(y=2.0, line_dash="dot", line_color="red", row=3, col=1)
+        fig.add_hline(y=-2.0, line_dash="dot", line_color="red", row=3, col=1)
+        fig.update_yaxes(title="Sigma", row=3, col=1, gridcolor='#222')
+
+        # ROW 4: Alpha/Beta Convergence (Dual Axis)
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['rolling_beta'], name='Beta (6m)', 
+                                 line=dict(color='#ffa500', width=1.5)), row=4, col=1)
+        fig.add_trace(go.Scatter(x=combined.index, y=combined['rolling_alpha_ann'], name='Ann. Alpha', 
+                                 line=dict(color='#00ffcc', width=1.5, dash='solid')), row=4, col=1, secondary_y=True)
+        
+        fig.update_yaxes(title="Beta", row=4, col=1, gridcolor='#222')
+        fig.update_yaxes(title="Alpha", row=4, col=1, secondary_y=True, gridcolor='#222')
+
+        # ROW 5: Regime State
+        if 'market_regime' in combined.columns:
+            fig.add_trace(go.Scatter(x=combined.index, y=combined['market_regime'], name='Regime', 
+                                     fill='tozeroy', line=dict(color='#0088ff')), row=5, col=1)
+        else:
+             fig.add_trace(go.Scatter(x=combined.index, y=[1]*len(combined), name='Regime (Unknown)', 
+                                      line=dict(color='#333')), row=5, col=1)
+        
+        fig.update_layout(
+            height=1400, 
+            template='plotly_dark', 
+            paper_bgcolor="#1a1a1a",
+            plot_bgcolor="#111111",
+            font=dict(family="Courier New, monospace"),
+            hovermode="x unified",
+            margin=dict(l=50, r=50, t=60, b=40)
+        )
+        
+        return fig.to_html(full_html=False, include_plotlyjs='cdn')
 
     def generate(self, df: pl.DataFrame, trades_df: pl.DataFrame = None):
-        print("ARCHITECT: Compiling Hyper-Grid Tear Sheet with Trade Visualization...")
+        print("ARCHITECT: Compiling Hyper-Grid Tear Sheet (V9 Engine)...")
         
-        # 1. CORE PHYSICS
+        # 1. CORE PHYSICS (Polars)
         df = df.with_columns([
             pl.col("equity").pct_change().alias("ret"),
             pl.col("equity").cum_max().alias("peak")
@@ -82,268 +219,128 @@ class PolarsTearSheet:
             (pl.col("equity") / pl.col("peak") - 1).alias("drawdown")
         ]).drop_nulls()
 
-        # 2. VECTORIZED METRICS
+        # 2. METRICS
         total_days = df.height
         years = total_days / 252.0
-        
         cum_ret = (df["equity"][-1] / df["equity"][0]) - 1
         cagr = (df["equity"][-1] / df["equity"][0]) ** (1 / years) - 1
         vol = df["ret"].std() * np.sqrt(252)
         sharpe = (df["ret"].mean() * 252 - self.rf) / vol
-        
-        neg_rets = df.filter(pl.col("ret") < 0)["ret"]
-        pos_rets = df.filter(pl.col("ret") > 0)["ret"]
-        sortino = (df["ret"].mean() * 252 - self.rf) / (neg_rets.std() * np.sqrt(252))
         max_dd = df["drawdown"].min()
-        calmar = cagr / abs(max_dd)
         
-        skew = df["ret"].skew()
-        kurt = df["ret"].kurtosis()
-        var_95 = df["ret"].quantile(0.05)
-        cvar_95 = df.filter(pl.col("ret") <= var_95)["ret"].mean()
+        # 3. PREPARE V9 DASHBOARD
+        df_pd = df.to_pandas()
+        df_pd['date'] = pd.to_datetime(df_pd['date'])
         
-        win_rate = len(pos_rets) / total_days
-        avg_win = pos_rets.mean()
-        avg_loss = neg_rets.mean()
-        win_loss_ratio = avg_win / abs(avg_loss)
-        kelly = win_rate - ((1 - win_rate) / win_loss_ratio)
-        gain_pain = pos_rets.sum() / abs(neg_rets.sum())
-        ulcer_index = np.sqrt((df["drawdown"]**2).mean())
+        if trades_df is not None:
+             daily_regime = trades_df.group_by("date").agg(pl.col("market_regime").mean()).sort("date").to_pandas()
+             daily_regime['date'] = pd.to_datetime(daily_regime['date'])
+             df_pd = df_pd.merge(daily_regime, on='date', how='left').fillna(1.0)
 
-        # 3. TABLES
-        dd_table = self.get_drawdown_table(df)
+        bench = self.fetch_benchmark_data(df_pd['date'].min(), df_pd['date'].max())
+        plotly_html = self.generate_v9_dashboard(df_pd, bench)
+
+        # 4. PREPARE TABLES
         eoy_table = self.get_eoy_table(df)
         top_winners, top_losers = self.get_top_trades(trades_df)
         trade_freq = self.get_trade_frequency(trades_df)
-
-        # 4. TRADE STATS
-        total_trades = trades_df.height if trades_df is not None else 0
-        unique_tickers = trades_df["ticker"].n_unique() if trades_df is not None else 0
-        total_gross = trades_df["gross_pnl"].sum() if trades_df is not None else 0
-        total_friction = trades_df["friction_pnl"].sum() if trades_df is not None else 0
-        total_net = trades_df["net_pnl"].sum() if trades_df is not None else 0
-
-        # 5. PREPARE JS DATA
-        dates_js = json.dumps(df["date"].dt.strftime("%Y-%m-%d").to_list())
-        equity_js = json.dumps(df["equity"].to_list())
-        drawdown_js = json.dumps((df["drawdown"] * 100).to_list())
+        dd_table = self.get_drawdown_table(df)
         
-        # Daily P&L for histogram
-        daily_pnl = (df["ret"] * 100).to_list()
-        daily_pnl_js = json.dumps(daily_pnl)
+        total_trades = trades_df.height if trades_df is not None else 0
+        total_net = trades_df["net_pnl"].sum() if trades_df is not None else 0
+        total_friction = trades_df["friction_pnl"].sum() if trades_df is not None else 0
 
-        # 6. GENERATE HTML
+        # 5. GENERATE HTML
         html_content = f"""
         <!DOCTYPE html>
         <html>
         <head>
-            <title>ARCHITECT V3: Institutional Report</title>
-            <script src="https://cdn.plot.ly/plotly-2.24.1.min.js"></script>
+            <title>ARCHITECT V9: Quantum Diagnostics</title>
             <style>
-                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: #0a0a0a; color: #e0e0e0; margin: 30px; font-size: 13px; }}
-                h1, h2, h3 {{ font-weight: 400; color: #00d4aa; border-bottom: 1px solid #333; padding-bottom: 5px; }}
-                .grid-container {{ display: grid; grid-template-columns: 380px 1fr; gap: 20px; }}
-                .metrics-table {{ width: 100%; border-collapse: collapse; background: #1a1a1a; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }}
-                .metrics-table td {{ padding: 6px 12px; border-bottom: 1px solid #2a2a2a; }}
-                .metrics-table td:last-child {{ text-align: right; font-weight: 500; font-family: 'SF Mono', monospace; }}
-                .section-header {{ background-color: #1e3a2f; font-weight: bold; text-align: left; padding: 8px 12px; color: #00d4aa; }}
-                .negative {{ color: #ff6b6b; }} .positive {{ color: #00d4aa; }}
-                .chart-box {{ background: #1a1a1a; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); border-radius: 4px; }}
-                table.data-table {{ width: 100%; border-collapse: collapse; text-align: right; background: #1a1a1a; margin-bottom: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }}
-                table.data-table th, table.data-table td {{ padding: 8px; border-bottom: 1px solid #2a2a2a; }}
-                table.data-table th {{ background-color: #1e3a2f; text-align: center; color: #00d4aa; }}
-                .stats-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 15px; margin-bottom: 20px; }}
-                .stat-card {{ background: #1a1a1a; padding: 15px; border-radius: 4px; text-align: center; }}
-                .stat-value {{ font-size: 24px; font-weight: bold; font-family: 'SF Mono', monospace; }}
-                .stat-label {{ font-size: 11px; color: #888; margin-top: 5px; }}
+                body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace; background-color: #050505; color: #e0e0e0; margin: 0; padding: 20px; }}
+                h1, h2 {{ color: #00ffcc; font-weight: 300; letter-spacing: 2px; text-transform: uppercase; border-bottom: 1px solid #333; }}
+                .container {{ max-width: 1400px; margin: 0 auto; }}
+                .grid-stats {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 30px; }}
+                .card {{ background: #111; padding: 20px; border: 1px solid #222; text-align: center; }}
+                .value {{ font-size: 28px; font-weight: bold; font-family: 'Courier New', monospace; }}
+                .label {{ font-size: 12px; color: #888; margin-top: 5px; text-transform: uppercase; }}
+                .pos {{ color: #00ffcc; }} .neg {{ color: #ff5555; }}
+                
+                .dashboard-container {{ background: #111; padding: 10px; border: 1px solid #222; margin-bottom: 30px; }}
+                
+                table {{ width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 12px; background: #111; }}
+                th, td {{ padding: 10px; text-align: right; border-bottom: 1px solid #222; }}
+                th {{ text-align: center; color: #00ffcc; text-transform: uppercase; border-bottom: 2px solid #00ffcc; }}
+                td:first-child {{ text-align: left; color: #fff; font-weight: bold; }}
             </style>
         </head>
         <body>
-            <h1>ARCHITECT V3: Quantitative Tear Sheet</h1>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value positive">₹{df['equity'][-1]:,.0f}</div>
-                    <div class="stat-label">FINAL EQUITY</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value {'positive' if cagr>0 else 'negative'}">{cagr*100:.1f}%</div>
-                    <div class="stat-label">CAGR</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{sharpe:.2f}</div>
-                    <div class="stat-label">SHARPE RATIO</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value negative">{max_dd*100:.1f}%</div>
-                    <div class="stat-label">MAX DRAWDOWN</div>
-                </div>
-            </div>
-            
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-value">{total_trades:,}</div>
-                    <div class="stat-label">TOTAL TRADES</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value">{unique_tickers}</div>
-                    <div class="stat-label">UNIQUE STOCKS</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value positive">₹{total_gross:,.0f}</div>
-                    <div class="stat-label">GROSS P&L</div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-value negative">₹{total_friction:,.0f}</div>
-                    <div class="stat-label">FRICTION PAID</div>
-                </div>
-            </div>
-            
-            <div class="grid-container">
-                <div>
-                    <table class="metrics-table">
-                        <tr class="section-header"><td colspan="2">Returns & CAGR</td></tr>
-                        <tr><td>Initial Capital</td><td>₹ {df['equity'][0]:,.2f}</td></tr>
-                        <tr><td>Final Equity</td><td>₹ {df['equity'][-1]:,.2f}</td></tr>
-                        <tr><td>Cumulative Return</td><td class="{'positive' if cum_ret>0 else 'negative'}">{cum_ret*100:.2f}%</td></tr>
-                        <tr><td>CAGR</td><td class="{'positive' if cagr>0 else 'negative'}">{cagr*100:.2f}%</td></tr>
-                        <tr><td>Avg. Daily Return</td><td>{df['ret'].mean()*100:.3f}%</td></tr>
-                        
-                        <tr class="section-header"><td colspan="2">Risk & Ratios</td></tr>
-                        <tr><td>Volatility (Ann.)</td><td>{vol*100:.2f}%</td></tr>
-                        <tr><td>Sharpe Ratio</td><td>{sharpe:.2f}</td></tr>
-                        <tr><td>Sortino Ratio</td><td>{sortino:.2f}</td></tr>
-                        <tr><td>Calmar Ratio</td><td>{calmar:.2f}</td></tr>
-                        <tr><td>Max Drawdown</td><td class="negative">{max_dd*100:.2f}%</td></tr>
-                        <tr><td>Ulcer Index</td><td>{ulcer_index:.2f}</td></tr>
-
-                        <tr class="section-header"><td colspan="2">Trading Physics</td></tr>
-                        <tr><td>Kelly Criterion</td><td>{kelly*100:.2f}%</td></tr>
-                        <tr><td>Win Rate (Days)</td><td>{win_rate*100:.2f}%</td></tr>
-                        <tr><td>Avg. Win</td><td class="positive">{avg_win*100:.3f}%</td></tr>
-                        <tr><td>Avg. Loss</td><td class="negative">{avg_loss*100:.3f}%</td></tr>
-                        <tr><td>Win/Loss Ratio</td><td>{win_loss_ratio:.2f}</td></tr>
-                        <tr><td>Gain/Pain Ratio</td><td>{gain_pain:.2f}</td></tr>
-
-                        <tr class="section-header"><td colspan="2">Tail Risk / Distribution</td></tr>
-                        <tr><td>Daily VaR (95%)</td><td class="negative">{var_95*100:.2f}%</td></tr>
-                        <tr><td>Expected Shortfall (cVaR)</td><td class="negative">{cvar_95*100:.2f}%</td></tr>
-                        <tr><td>Skew</td><td>{skew:.2f}</td></tr>
-                        <tr><td>Kurtosis</td><td>{kurt:.2f}</td></tr>
-
-                        <tr class="section-header"><td colspan="2">System Audit (PnL vs Equity)</td></tr>
-                        <tr><td>Arithmetic PnL Sum</td><td>₹{total_net:,.0f}</td></tr>
-                        <tr><td>Geometric Growth</td><td>₹{df['equity'][-1] - df['equity'][0]:,.0f}</td></tr>
-                        <tr><td>Volatility Drag</td><td class="negative">₹{total_net - (df['equity'][-1] - df['equity'][0]):,.0f}</td></tr>
-                        <tr><td>Reality Check</td><td class="{'positive' if (df['equity'][-1] - df['equity'][0]) > total_net else 'negative'}">{"COMPOUNDING" if (df['equity'][-1] - df['equity'][0]) > total_net else "DRAG"}</td></tr>
-                    </table>
+            <div class="container">
+                <h1>Architect V9: Quantum Diagnostics</h1>
+                
+                <div class="grid-stats">
+                    <div class="card"><div class="value pos">₹{df['equity'][-1]:,.0f}</div><div class="label">Final Equity</div></div>
+                    <div class="card"><div class="value {'pos' if cagr>0 else 'neg'}">{cagr*100:.2f}%</div><div class="label">CAGR</div></div>
+                    <div class="card"><div class="value">{sharpe:.2f}</div><div class="label">Sharpe Ratio</div></div>
+                    <div class="card"><div class="value neg">{max_dd*100:.2f}%</div><div class="label">Max Drawdown</div></div>
+                    <div class="card"><div class="value">{total_trades}</div><div class="label">Total Trades</div></div>
+                    <div class="card"><div class="value neg">₹{total_friction:,.0f}</div><div class="label">Friction Paid</div></div>
                 </div>
 
-                <div>
-                    <div class="chart-box" id="equity_plot" style="height: 350px;"></div>
-                    <div class="chart-box" id="dd_plot" style="height: 200px;"></div>
-                    <div class="chart-box" id="returns_hist" style="height: 200px;"></div>
+                <div class="dashboard-container">
+                    {plotly_html}
+                </div>
 
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px;">
-                        <div>
-                            <h3>EOY Returns</h3>
-                            <table class="data-table">
-                                <thead><tr><th>Year</th><th>Strategy</th></tr></thead>
-                                <tbody>
-                                    {"".join([f"<tr><td style='text-align:center;'>{row['Year']}</td><td class='{'positive' if row['Strategy']>0 else 'negative'}'>{row['Strategy']*100:.2f}%</td></tr>" for row in eoy_table])}
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div>
-                            <h3>Top 20 Stocks by P&L</h3>
-                            <table class="data-table">
-                                <thead><tr><th>Ticker</th><th>Trades</th><th>Total P&L</th></tr></thead>
-                                <tbody>
-                                    {"".join([f"<tr><td style='text-align:left;'>{r['ticker']}</td><td style='text-align:center;'>{r['trades']}</td><td class='{'positive' if r['total_pnl']>0 else 'negative'}'>₹{r['total_pnl']:,.0f}</td></tr>" for r in trade_freq])}
-                                </tbody>
-                            </table>
-                        </div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                    <div>
+                        <h2>EOY Returns</h2>
+                        <table>
+                            <thead><tr><th>Year</th><th>Return</th></tr></thead>
+                            <tbody>
+                                {"".join([f"<tr><td>{r['Year']}</td><td class='{'pos' if r['Strategy']>0 else 'neg'}'>{r['Strategy']*100:.2f}%</td></tr>" for r in eoy_table])}
+                            </tbody>
+                        </table>
                     </div>
-
-                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px;">
-                        <div>
-                            <h3>Top 20 Winning Trades</h3>
-                            <table class="data-table">
-                                <thead><tr><th>Date</th><th>Ticker</th><th>P&L</th></tr></thead>
-                                <tbody>
-                                    {"".join([f"<tr><td style='text-align:center;'>{r['date']}</td><td style='text-align:left;'>{r['ticker']}</td><td class='positive'>₹{r['net_pnl']:,.0f}</td></tr>" for r in top_winners])}
-                                </tbody>
-                            </table>
-                        </div>
-
-                        <div>
-                            <h3>Top 20 Losing Trades</h3>
-                            <table class="data-table">
-                                <thead><tr><th>Date</th><th>Ticker</th><th>P&L</th></tr></thead>
-                                <tbody>
-                                    {"".join([f"<tr><td style='text-align:center;'>{r['date']}</td><td style='text-align:left;'>{r['ticker']}</td><td class='negative'>₹{r['net_pnl']:,.0f}</td></tr>" for r in top_losers])}
-                                </tbody>
-                            </table>
-                        </div>
+                    <div>
+                        <h2>Worst Drawdowns</h2>
+                        <table>
+                            <thead><tr><th>Started</th><th>Recovered</th><th>Depth</th><th>Days</th></tr></thead>
+                            <tbody>
+                                {"".join([f"<tr><td>{r['started']}</td><td>{r['recovered']}</td><td class='neg'>{r['drawdown']*100:.2f}%</td><td>{r['days']}</td></tr>" for r in dd_table])}
+                            </tbody>
+                        </table>
                     </div>
-
-                    <h3>Worst 10 Drawdowns</h3>
-                    <table class="data-table">
-                        <thead><tr><th>Started</th><th>Recovered</th><th>Drawdown</th><th>Days</th></tr></thead>
-                        <tbody>
-                            {"".join([f"<tr><td style='text-align:center;'>{r['started']}</td><td style='text-align:center;'>{r['recovered']}</td><td class='negative'>{r['drawdown']*100:.2f}%</td><td style='text-align:center;'>{r['days']}</td></tr>" for r in dd_table])}
-                        </tbody>
-                    </table>
                 </div>
+
+                <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 30px;">
+                     <div>
+                        <h2>Top Winners</h2>
+                        <table>
+                            <thead><tr><th>Date</th><th>Ticker</th><th>Profit</th></tr></thead>
+                            <tbody>
+                                {"".join([f"<tr><td>{r['date']}</td><td>{r['ticker']}</td><td class='pos'>₹{r['net_pnl']:,.0f}</td></tr>" for r in top_winners])}
+                            </tbody>
+                        </table>
+                    </div>
+                    <div>
+                        <h2>Top Losers</h2>
+                         <table>
+                            <thead><tr><th>Date</th><th>Ticker</th><th>Loss</th></tr></thead>
+                            <tbody>
+                                {"".join([f"<tr><td>{r['date']}</td><td>{r['ticker']}</td><td class='neg'>₹{r['net_pnl']:,.0f}</td></tr>" for r in top_losers])}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
             </div>
-
-            <script>
-                var layout_dark = {{
-                    paper_bgcolor: '#1a1a1a', plot_bgcolor: '#1a1a1a',
-                    font: {{color: '#e0e0e0'}},
-                    xaxis: {{gridcolor: '#2a2a2a'}},
-                    yaxis: {{gridcolor: '#2a2a2a'}}
-                }};
-
-                Plotly.newPlot('equity_plot', [{{
-                    x: {dates_js}, y: {equity_js}, type: 'scatter', mode: 'lines',
-                    line: {{color: '#00d4aa', width: 2}}, fill: 'tozeroy', fillcolor: 'rgba(0, 212, 170, 0.1)',
-                    name: 'Equity'
-                }}], {{
-                    ...layout_dark,
-                    title: {{text: 'Equity Curve (Gaussian Channel Strategy)', font: {{color: '#00d4aa'}}}},
-                    margin: {{t: 40, b: 30, l: 60, r: 20}}
-                }});
-
-                Plotly.newPlot('dd_plot', [{{
-                    x: {dates_js}, y: {drawdown_js}, type: 'scatter', mode: 'lines',
-                    line: {{color: '#ff6b6b', width: 1}}, fill: 'tozeroy', fillcolor: 'rgba(255, 107, 107, 0.3)',
-                    name: 'Drawdown'
-                }}], {{
-                    ...layout_dark,
-                    title: {{text: 'Drawdowns (%)', font: {{color: '#ff6b6b'}}}},
-                    margin: {{t: 40, b: 30, l: 60, r: 20}}
-                }});
-
-                Plotly.newPlot('returns_hist', [{{
-                    x: {daily_pnl_js}, type: 'histogram', nbinsx: 100,
-                    marker: {{color: '#00d4aa', line: {{color: '#0a0a0a', width: 0.5}}}},
-                    name: 'Daily Returns'
-                }}], {{
-                    ...layout_dark,
-                    title: {{text: 'Daily Returns Distribution (%)', font: {{color: '#00d4aa'}}}},
-                    margin: {{t: 40, b: 30, l: 60, r: 20}},
-                    bargap: 0.05
-                }});
-            </script>
         </body>
         </html>
         """
 
-        output_file = "architect_tearsheet_v2.html"
+        output_file = "architect_tearsheet_v3.html"
         with open(output_file, "w", encoding="utf-8") as f:
             f.write(html_content)
 
-        print(f"SUCCESS: Report saved as '{output_file}'. Opening browser...")
+        print(f"SUCCESS: V9 Tearsheet saved as '{output_file}'. Opening browser...")
         webbrowser.open('file://' + os.path.realpath(output_file))

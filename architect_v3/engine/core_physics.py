@@ -60,37 +60,106 @@ class VectorizedCore:
         MAX_VOLUME_PARTICIPATION = 0.02
 
         # ---------------------------------------------------------
-        # 1. EXTRACT NIFTY 50 REGIME (The Master Circuit Breaker)
+        # 1. EXTRACT TRIANGULATION SENSORS (Nifty 50, Bank Nifty, VIX)
         # ---------------------------------------------------------
-        nifty_query = f"""
-            SELECT Date as date, Close as close 
+        
+        # SENSOR 1: BROAD MARKET (Anchor) - Nifty 50
+        broad_query = f"""
+            SELECT Date as date, Close as broad_close 
             FROM read_parquet('{self.data_path}', filename=true) 
-            WHERE REGEXP_MATCHES(filename, '\\^NSEI\\.parquet')
+            WHERE REGEXP_MATCHES(filename, '^NSEI\\.parquet')
             AND Date >= '{start_date}'
             AND Date <= '{end_date}'
         """
-        try:
-            nifty = duckdb.sql(nifty_query).pl()
-            
-            # Calculate 200-Day SMA for the Nifty
-            nifty = nifty.with_columns(
-                pl.col("date").cast(pl.Datetime("us")).alias("date")
-            ).sort("date").with_columns([
-                pl.col("close").rolling_mean(window_size=200).shift(1).alias("nifty_sma_200")
-            ]).with_columns([
-                # 1 = Bull Market (Buy), 0 = Bear Market (Cash)
-                pl.when(pl.col("close") > pl.col("nifty_sma_200"))
-                .then(1.0).otherwise(0.0).alias("market_regime")
-            ]).select(["date", "market_regime"])
-        except Exception as e:
-            print(f"ARCHITECT WARNING: Could not load Nifty data for regime filter ({e}). Defaulting to Bull Market.")
-            base_dates = self._get_unified_lazyframe(start_date).select("date").unique().collect()
-            nifty = base_dates.with_columns(pl.lit(1.0).alias("market_regime"))
+        
+        # SENSOR 2: RISK CANARY (High Beta) - Bank Nifty
+        canary_query = f"""
+            SELECT Date as date, Close as canary_close 
+            FROM read_parquet('{self.data_path}', filename=true) 
+            WHERE REGEXP_MATCHES(filename, '^NSEBANK\\.parquet')
+            AND Date >= '{start_date}'
+            AND Date <= '{end_date}'
+        """
+        
+        # SENSOR 3: FEAR SIREN (VIX)
+        vix_query = f"""
+            SELECT Date as date, Close as vix_close
+            FROM read_parquet('{self.data_path}', filename=true)
+            WHERE REGEXP_MATCHES(filename, '^INDIAVIX\\.parquet')
+            AND Date >= '{start_date}'
+            AND Date <= '{end_date}'
+        """
 
+        try:
+            broad = duckdb.sql(broad_query).pl().with_columns(pl.col("date").cast(pl.Datetime("us")))
+            canary = duckdb.sql(canary_query).pl().with_columns(pl.col("date").cast(pl.Datetime("us")))
+            try:
+                vix = duckdb.sql(vix_query).pl().with_columns(pl.col("date").cast(pl.Datetime("us")))
+            except:
+                vix = None
+
+            # Join Sensors
+            sensors = broad.join(canary, on="date", how="left").sort("date")
+            if vix is not None:
+                sensors = sensors.join(vix, on="date", how="left").fill_null(0.0)
+            else:
+                sensors = sensors.with_columns(pl.lit(0.0).alias("vix_close"))
+                
+            # Calculate Indicators
+            sensors = sensors.with_columns([
+                # BROAD: SMA 200 (Result: Bear if < SMA200)
+                pl.col("broad_close").rolling_mean(window_size=200).shift(1).alias("broad_sma_200"),
+                
+                # CANARY: SMA 50 + ROC 20
+                pl.col("canary_close").rolling_mean(window_size=50).shift(1).alias("canary_sma_50"),
+                (pl.col("canary_close") / pl.col("canary_close").shift(21) - 1).alias("canary_roc_20")
+            ]).with_columns([
+                # TRIANGULATION LOGIC:
+                # 1. Broad Trend Broken?
+                (pl.col("broad_close") < pl.col("broad_sma_200")).alias("signal_broad_bear"),
+                
+                # 2. Canary Trend Broken or Crashing?
+                ((pl.col("canary_close") < pl.col("canary_sma_50")) | (pl.col("canary_roc_20") < -0.05)).alias("signal_canary_bear"),
+                
+                # 3. Panic Spike?
+                (pl.col("vix_close") > 24.0).alias("signal_vix_panic")
+            ]).with_columns([
+                # FINAL VOTE: If ANY are True -> BEAR
+                pl.when(
+                    pl.col("signal_broad_bear") | pl.col("signal_canary_bear") | pl.col("signal_vix_panic")
+                )
+                .then(0.0)
+                .otherwise(1.0)
+                .alias("market_regime"),
+                
+                # Pass VIX for display
+                (pl.col("vix_close") / 100.0).alias("nifty_vol"),
+                
+                # Dummy scaler
+                pl.lit(1.0).alias("vol_scaler")
+                
+            ]).select(["date", "market_regime", "vol_scaler", "nifty_vol"])
+            
+            nifty = sensors # Alias for downstream compatibility
+
+        except Exception as e:
+            print(f"ARCHITECT WARNING: Could not load Sensor data ({e}). Defaulting to Bull Market.")
+            base_dates = self._get_unified_lazyframe(start_date).select("date").unique().collect()
+            nifty = base_dates.with_columns([
+                pl.lit(1.0).alias("market_regime"),
+                pl.lit(1.0).alias("vol_scaler"),
+                pl.lit(0.15).alias("nifty_vol")
+            ])
+        
         # ---------------------------------------------------------
-        # 2. RUN STANDARD STRATEGY (NO EARLY FILTER)
+        # 2. RUN STANDARD STRATEGY
         # ---------------------------------------------------------
         base = self._get_unified_lazyframe(start_date=start_date)
+
+        # Join Regime EARLY (To scale weights)
+        # Ensure date columns maximize compatibility (cast to Datetime[us])
+        base = base.with_columns(pl.col("date").cast(pl.Datetime("us")))
+        base = base.sort("date").join(nifty.lazy(), on="date", how="left").fill_null(1.0)
 
         strategy = (
             base.sort(["ticker", "date"])
@@ -125,53 +194,62 @@ class VectorizedCore:
             pl.col("close") > (pl.col("rolling_peak_60") * 0.85)
         )
 
+
+
         filtered = strategy.filter(pl.col("rupee_volume") > 50000000)
         filtered = filtered.filter(pl.col("energy") >= energy_threshold)
+        
+        # --- DATA HYGIENE: FILTER ANOMALIES ---
+        # Exclude stocks with > 5% Daily Volatility (likely Penny Stocks or Splits)
+        # Exclude stocks with > 300% Momentum (likely Pump & Dump or Data Error)
+        filtered = filtered.filter(pl.col("volatility") < 0.05)
+        filtered = filtered.filter(pl.col("momentum") < 3.0) # Cap at 300%
+        
+        # --- PHASE 8: AMT / VOLUME PROFILE PROXY ---
+        # "Avoid The Chop"
+        # Efficiency Ratio > 0.3 means price is moving with purpose (Out of Value).
+        # Efficiency Ratio <= 0.3 means prices are noise (In Value/Equilibrium).
+        filtered = filtered.filter(pl.col("efficiency") > 0.3)
 
         trades_lf = (
             filtered.sort(["date", "momentum"], descending=[False, True])
             .group_by("date").head(top_n)
             
-            # --- ARCHITECT PROTOCOL v5.0 (Intelligent Velocity) ---
-            # 1. METRICS: 20-Day Volatility & 50-Day SMA
-            .with_columns([
-                 (pl.col("volatility") * (252**0.5)).alias("ann_vol"),
-                 pl.col("close").rolling_mean(window_size=50).over("ticker").alias("sma_50")
-            ])
-            .with_columns([
-                # 2. BASE SIZING (Risk Parity, Target Vol = 30%)
-                #    Weight = 0.30 / Ann_Vol
-                (0.30 / pl.col("ann_vol")).alias("raw_weight")
-            ])
-            .with_columns([
-                # 3. INTELLIGENT BRAKE LOGIC
-                #    Condition A: Extreme Volatility (> 80%)
-                #    Condition B: Downtrend (Price < SMA 50)
-                #    Logic: Only Brake (0.33x) if BOTH are true. Else, Full Speed.
-                pl.when((pl.col("ann_vol") > 0.80) & (pl.col("close") < pl.col("sma_50")))
-                .then(pl.col("raw_weight") * 0.33)
-                .otherwise(pl.col("raw_weight"))
-                .alias("vol_weight")
-            ])
+            # --- ARCHITECT PROTOCOL V7 (The Regime Guard) ---
+            # 1. SYSTEM STATE (Derived from Nifty)
+            #    market_regime is already joined: 1.0 (Bull), 0.5 (Vol), 0.0 (Bear)
             
-            # 4. Momentum Scaler (Retained from v1.0)
+            # 2. ALPHA ENGINE (Aggressive Risk Parity)
+            #    Target Vol = 30% (High Conviction)
+            .with_columns([
+                 (pl.col("volatility") * (252**0.5)).alias("ann_vol")
+            ])
+            .with_columns([
+                (0.30 / pl.col("ann_vol")).alias("alpha_weight")
+            ])
+
+            # 3. Momentum Scaler (Size up winners)
             .with_columns([
                 pl.col("momentum").clip(0.0, 1.0).alias("signal_strength")
             ])
 
+            # 4. Apply Regime Guard
+            #    Final Weight = Alpha * Signal * Regime
             .with_columns([
                 (pl.col("rupee_volume") * MAX_VOLUME_PARTICIPATION / initial_capital).alias("max_weight")
             ])
             .with_columns([
-                # Final Weight Calculation
-                # Constraints: 
-                # 1. Cap single stock at 30% (0.30) - Increased for v5
-                # 2. Liquidity (Max Weight)
-                # 3. Intelligent Volatility Sizing
+                # Constraints: Cap 20% (Max 1.0x Leverage across 5 assets)
+                # REVERTED: Removed all Dynamic Leverage / Vol Targeting.
+                # Logic: Risk Parity * Momentum * Regime Guard.
                 pl.min_horizontal(
-                    (pl.col("vol_weight") * pl.col("signal_strength")),
+                    (
+                        pl.col("alpha_weight") * 
+                        pl.col("signal_strength") * 
+                        pl.col("market_regime")
+                    ),
                     pl.col("max_weight"), 
-                    pl.lit(0.30)  # Protocol v5: 30% Max
+                    pl.lit(0.20)
                 ).alias("weight")
             ])
             .sort(["ticker", "date"])
@@ -192,12 +270,38 @@ class VectorizedCore:
             (pl.col("weight") * initial_capital).alias("position_value"),
             (pl.col("gross_return") * initial_capital).alias("gross_pnl"),
             (pl.col("friction_cost") * initial_capital).alias("friction_pnl"),
-            (pl.col("net_return") * initial_capital).alias("net_pnl")
+            (pl.col("net_return") * initial_capital).alias("net_pnl"),
+            
+            # --- BLACK BOX RECORDER LOGIC (Vectorized) ---
+            # 1. Structure Tag
+            pl.when(pl.col("efficiency") > 0.3).then(pl.lit("VACUUM")).otherwise(pl.lit("TRAPPED")).alias("structure_tag"),
+            
+            # 2. Market State
+            pl.when(pl.col("market_regime") == 1.0).then(pl.lit("BULL_TURBO"))
+              .when(pl.col("market_regime") == 0.5).then(pl.lit("VOLATILE_CRUISE"))
+              .otherwise(pl.lit("BEAR_DEFENSE")).alias("market_state"),
+              
+            # 3. Decision Reason (Explainability Layer)
+            pl.when(pl.col("market_regime") == 0.0).then(pl.lit("Regime Guard (Bear)"))
+              .when(pl.col("market_regime") == 0.5).then(pl.lit("Vol Penalty (Risk Off)"))
+              .when(pl.col("efficiency") < 0.3).then(pl.lit("Volume Profile (Chop)")) # Won't trigger if filtered
+              .when(pl.col("kinetic_energy") > 0.0025).then(pl.lit("High Energy Trend"))
+              .otherwise(pl.lit("Standard Entry")).alias("decision_reason"),
+            
+            # 4. Math: Leverage Mult (Fixed at 1.0 for Pure Cash)
+            pl.lit(1.0).alias("leverage_mult"),
+            
+            # 5. Math: Gaussian Z-Score approx
+            # Width = 4 std devs (2 up, 2 down). Std = (Upper - Lower) / 4
+            ((pl.col("close") - pl.col("sma_20")) / ((pl.col("upper_band") - pl.col("lower_band")) / 4)).alias("gaussian_zscore")
         ]).select([
             "date", "ticker", "close", "sma_20", "upper_band", "lower_band",
             "momentum", "energy", "volatility", "rupee_volume",
-            "vol_weight", "max_weight", "weight", "fwd_return", "turnover",
-            "position_value", "gross_pnl", "friction_pnl", "net_pnl"
+            "alpha_weight", "market_regime", "max_weight", "weight", "fwd_return", "turnover",
+            "position_value", "gross_pnl", "friction_pnl", "net_pnl",
+            "kinetic_energy", "efficiency", "nifty_vol",
+            # --- BLACK BOX RECORDER COLUMNS ---
+            "structure_tag", "leverage_mult", "market_state", "decision_reason", "gaussian_zscore"
         ]).sort(["date", "ticker"])
         
         trade_log.write_csv("trade_log.csv")
@@ -211,17 +315,12 @@ class VectorizedCore:
             .sort("date")
         )
         
-        # 4. APPLY LATE REGIME FILTER (Portfolio Level)
-        # Join the Nifty Regime with our daily portfolio returns
-        # Join on datetime[us] to match Nifty (which we cast to us earlier)
+        # 4. APPLY LATE REGIME FILTER (Removed - Handled at Weight Level)
+        # Note: We already applied the regime to the weights.
+        # So 'portfolio_return' doesn't need a second multiplier.
         daily_portfolio = daily_portfolio.with_columns(
-            pl.col("date").cast(pl.Datetime("us"))
-        ).join(nifty, on="date", how="left").fill_null(1.0)
-
-        # Apply the Circuit Breaker: If Nifty is bearish, return is 0 (Cash)
-        daily_portfolio = daily_portfolio.with_columns([
-            (pl.col("raw_portfolio_return") * pl.col("market_regime")).alias("portfolio_return")
-        ])
+             pl.col("raw_portfolio_return").alias("portfolio_return")
+        )
 
         # 5. COMPOUND EQUITY
         equity_curve = (

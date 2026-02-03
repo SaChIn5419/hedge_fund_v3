@@ -22,3 +22,4 @@ brokers:
   dhan:
     client_id: "YOUR_DHAN_CLIENT_ID" # Replace with your actual Client ID
     access_token: "YOUR_DHAN_TOKEN"  # Replace with your actual Access Token
+    benchmark_ticker: "^NSEI" # Broad Anchor (Triangulation Primary) # Was ^NSEI
