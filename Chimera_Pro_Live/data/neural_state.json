@@ -1,0 +1,22 @@
+{
+    "timestamp": "2026-02-12 15:47:48.557659",
+    "execution_state": {
+        "state": "IDLE",
+        "last_exec": 0,
+        "active_orders": 0
+    },
+    "regime": {
+        "regime": "STABLE",
+        "entropy": 1.471676151370106,
+        "volatility": 0.08815269004097324
+    },
+    "leverage": 0.5,
+    "latest_tick": {
+        "symboltoken": "3045",
+        "price": 1192.4,
+        "timestamp": 1770891474000,
+        "vol_traded": 0
+    },
+    "last_physics": "No Change",
+    "market_depth": 3
+}

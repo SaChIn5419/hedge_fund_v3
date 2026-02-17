@@ -2,11 +2,29 @@ import streamlit as st
 import pandas as pd
 import sys
 import os
+import asyncio
+import time
+from datetime import datetime
 
 # Add parent dir to path to import chimera_live
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from chimera_live import ChimeraLiveProtocol
+from chimera_execution.broker_angleone_async import AsyncAngleOneBroker
+from chimera_protocol.chimera_engine import validate_vacuum_with_depth
+try:
+    from Chimera_Pro_Live.chimera_governance.capital_brain import CapitalAllocationBrain
+except ImportError:
+    # Fallback mock if path issue
+    class CapitalAllocationBrain:
+        def __init__(self): pass
+        def update_allocation(self, data): return 1.0
+try:
+    from chimera_protocol.data_foundry import ChimeraFoundry
+    FOUNDRY = ChimeraFoundry()
+except:
+    FOUNDRY = None
 
 # --- PAGE CONFIG ---
 st.set_page_config(
@@ -84,6 +102,18 @@ def load_data():
         return pd.DataFrame()
     return pd.read_csv(LOG_FILE)
 
+# --- ANGEL ONE BRIDGE ---
+@st.cache_resource
+@st.cache_resource
+def get_broker():
+    """
+    Returns a cached, authenticated broker instance.
+    """
+    broker = AsyncAngleOneBroker()
+    if broker.login():
+        return broker
+    return None
+
 def main():
     st.title("☢️ CHIMERA LIVE CONTROL PANEL")
     
@@ -101,6 +131,25 @@ def main():
         value=dates[-1],
         format_func=lambda x: pd.to_datetime(x).strftime("%Y-%m-%d")
     )
+    
+    # LIVE MODE TOGGLE
+    live_mode = st.sidebar.checkbox("🔴 GO LIVE (ANGEL ONE)", value=False)
+    sim_mode = st.sidebar.checkbox("🧪 SIMULATE DEPTH (OFFLINE TEST)", value=False)
+    
+    if live_mode and sim_mode:
+        st.sidebar.error("Select only ONE mode.")
+        live_mode = False
+        sim_mode = False
+    
+    broker = None
+    if live_mode:
+        st.sidebar.warning("⚠️ CONNECTING TO LIVE MARKETS...")
+        broker = get_broker()
+        if broker:
+            st.sidebar.success("✅ CONNECTED")
+        else:
+            st.sidebar.error("❌ CONNECTION FAILED")
+            live_mode = False
 
     # --- EXECUTE PROTOCOL ---
     protocol = ChimeraLiveProtocol(df)
@@ -124,6 +173,40 @@ def main():
             st.markdown(f"- **{action}**")
     else:
         st.success("### ✅ NO ACTIONS REQUIRED")
+
+    st.markdown("---")
+
+    # --- GOVERNANCE LAYER (INTEGRATED) ---
+    st.markdown("### 🧠 CAPITAL BRAIN AI")
+    c_brain_1, c_brain_2 = st.columns([1, 3])
+    
+    with c_brain_1:
+         # MAP STATUS TO REGIME
+         regime_map = {
+             "GREEN": "TRENDING",
+             "YELLOW": "STABLE", # Cautionary
+             "RED": "CHAOS"
+         }
+         current_regime = regime_map.get(status, "STABLE")
+         
+         # Instantiate Brain
+         brain = CapitalAllocationBrain()
+         
+         # Get Recommendation
+         # We need volatility. Let's use a proxy or default 0.015 (1.5%) if not in df
+         # If Nifty Vol available, use it.
+         vol_proxy = 0.015
+         if 'nifty_vol' in df.columns:
+             try:
+                 vol_proxy = df['nifty_vol'].iloc[-1]
+             except: pass
+             
+         rec_leverage = brain.update_allocation({"regime": current_regime, "volatility": vol_proxy})
+         
+         st.metric("AI RECOMMENDED LEVERAGE", f"{rec_leverage:.1f}x", delta=f"Regime: {current_regime}")
+
+    with c_brain_2:
+        st.info(f"**LOGIC:** The Capital Brain has analyzed the market state as **{current_regime}**. Based on Volatility ({vol_proxy:.1%}), it recommends resizing all positions to **{rec_leverage}x** base sizing.")
 
     st.markdown("---")
 
@@ -180,8 +263,107 @@ def main():
         st.markdown("</div>", unsafe_allow_html=True)
 
     st.markdown("---")
-    with st.expander("🔍 VIEW RAW TELEMETRY"):
-        st.dataframe(df[df['date'] == selected_date])
+    
+    # --- LIVE MICROSTRUCTURE VIEW ---
+    current_positions = df[df['date'] == selected_date]
+    
+    with st.expander("🔍 VIEW TELEMETRY & MICROSTRUCTURE", expanded=True):
+        if not live_mode and not sim_mode:
+            st.dataframe(current_positions)
+        else:
+            if sim_mode:
+                st.info("🧪 RUNNING SIMULATION: GENERATING MOCK MICROSTRUCTURE DATA")
+            else:
+                st.info("📡 FETCHING LIVE MARKET DEPTH (ANGEL ONE)...")
+            
+            # Prepare container for live data
+            live_data_list = []
+            
+            # Create a progress bar
+            prog_bar = st.progress(0)
+            
+            # Filter for active positions only
+            active_pos = current_positions[current_positions['ticker'] != 'CASH']
+            total = len(active_pos)
+            
+            broker = get_broker() if live_mode else None
+            
+            import random # For sim
+            
+            for idx, row in enumerate(active_pos.itertuples()):
+                ticker = row.ticker
+                micro = None
+                
+                if live_mode:
+                    # Fetch Microstructure
+                    try:
+                        micro = asyncio.run(broker.get_market_microstructure("NSE", ticker))
+                    except Exception as e:
+                        print(f"Error fetching {ticker}: {e}")
+                elif sim_mode:
+                    # Simulate Data
+                    # Randomize friction to show both Safe and Blocked scenarios
+                    rand_friction = random.uniform(0.5, 5.0) 
+                    micro = {
+                        'ltp': row.close * random.uniform(0.99, 1.01),
+                        'friction': rand_friction,
+                        'total_buy_pressure': 100000,
+                        'total_sell_pressure': 100000 * rand_friction
+                    }
+                
+                item = {
+                    'Ticker': ticker,
+                    'Weight': row.weight,
+                    'Log_Close': row.close,
+                    'Signal': 'BULL_TURBO', # Assuming active means bull/turbo
+                    'Structure': row.structure_tag
+                }
+                
+                if micro:
+                    # RECORD TO DATA LAKE
+                    if live_mode and FOUNDRY:
+                         # timestamp logic if not present
+                         if 'timestamp' not in micro:
+                             micro['timestamp'] = datetime.now()
+                         FOUNDRY.record_depth_snapshot(ticker, micro)
+
+                    item['Live_LTP'] = micro['ltp']
+                    item['Friction'] = f"{micro['friction']:.2f}"
+                    # item['Buy_Qty'] = micro['total_buy_pressure']
+                    # item['Sell_Qty'] = micro['total_sell_pressure']
+                    
+                    # PnL Calc
+                    entry = row.close 
+                    curr = micro['ltp']
+                    ret = (curr - entry) / entry
+                    item['Live_PnL%'] = f"{ret*100:.2f}%"
+                    
+                    # VALIDATE VACUUM
+                    is_safe = validate_vacuum_with_depth(item['Signal'], micro)
+                    if is_safe:
+                        item['Vacuum_Status'] = "✅ REAL"
+                    else:
+                        item['Vacuum_Status'] = "⛔ FAKE (WALL DETECTED)"
+                    
+                else:
+                    item['Live_LTP'] = "Offline"
+                    item['Friction'] = "N/A"
+                    item['Vacuum_Status'] = "❓ UNKNOWN"
+
+                live_data_list.append(item)
+                prog_bar.progress((min(idx + 1, total)) / total)
+            
+            live_df = pd.DataFrame(live_data_list)
+            st.dataframe(live_df)
+            
+            # Friction Warning
+            if 'Friction' in live_df.columns:
+                 # Clean column for check
+                 live_df['Friction_Val'] = pd.to_numeric(live_df['Friction'], errors='coerce')
+                 high_fri = live_df[live_df['Friction_Val'] > 3.0]
+                 if not high_fri.empty:
+                     st.error(f"⚠️ HIGH FRICTION (WALLS) DETECTED IN: {', '.join(high_fri['Ticker'].tolist())}")
+                     st.caption("These trades would be BLOCKED by the Execution Engine.")
 
 if __name__ == "__main__":
     main()

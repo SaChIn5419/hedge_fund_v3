@@ -1,0 +1,7 @@
+{
+    "lookback_energy": 21,
+    "lookback_vp": 60,
+    "lookback_gaussian": 140,
+    "vol_spike_threshold": 0.02,
+    "max_order_chunk": 0.25
+}
